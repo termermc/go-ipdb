@@ -2,7 +2,7 @@
 
 Self-contained IP database library for Go.
 
-Automatically downloads and caches various types of IP databases for local in-process querying without reaching out to external IPs.
+Automatically downloads and caches various types of IP databases for local in-process querying without reaching out to external APIs.
 
 Supports the following operations:
  - Get ISO 3166 country code for IP address (geoIP)
