@@ -1,4 +1,4 @@
-module github.com/termermc/ipdb-geoip-tools
+module github.com/termermc/go-ipdb
 
 go 1.24.5
 

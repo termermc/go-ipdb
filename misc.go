@@ -1,4 +1,4 @@
-package ipdb_geoip_tools
+package ipdb
 
 import "io"
 

@@ -1,4 +1,4 @@
-package ipdb_geoip_tools
+package ipdb
 
 import (
 	"encoding/json"
@@ -13,12 +13,12 @@ import (
 type StorageDriver interface {
 	// WriteDatabase opens a database file of the specified type for writing.
 	// The reader will be closed by the function regardless of whether an error occurs.
-	WriteDatabase(dbType IpdbType, input io.ReadCloser) error
+	WriteDatabase(dbType DbType, input io.ReadCloser) error
 
 	// ReadDatabase opens a database file of the specified type for reading.
 	// The caller is expected to close the reader.
 	// If there is no cached database of the specified type, the function will return syscall.ENOENT.
-	ReadDatabase(dbType IpdbType) (io.ReadCloser, error)
+	ReadDatabase(dbType DbType) (io.ReadCloser, error)
 
 	// WriteCheckpoints writes all checkpoints.
 	// Checkpoints must not be nil.
@@ -69,22 +69,22 @@ func NewFsStorageDriver(dataDir string) (*FsStorageDriver, error) {
 
 // Returns the filename for the specified DB type.
 // If the type valid is invalid, returns ErrInvalidIpdbType.
-func (s *FsStorageDriver) dbTypeToFilename(dbType IpdbType) (string, error) {
+func (s *FsStorageDriver) dbTypeToFilename(dbType DbType) (string, error) {
 	switch dbType {
-	case IpdbTypeTorExit:
+	case DbTypeTorExit:
 		return "tor_exit_node_ips.txt", nil
-	case IpdbTypeDatacenter:
+	case DbTypeDatacenter:
 		return "datacenter_cidr_ranges.txt", nil
-	case IpdbTypeGeoIpv4:
+	case DbTypeGeoIpv4:
 		return "geo_ipv4.mmdb", nil
-	case IpdbTypeGeoIpv6:
+	case DbTypeGeoIpv6:
 		return "geo_ipv6.mmdb", nil
 	default:
 		return "", ErrInvalidIpdbType
 	}
 }
 
-func (s *FsStorageDriver) WriteDatabase(dbType IpdbType, input io.ReadCloser) error {
+func (s *FsStorageDriver) WriteDatabase(dbType DbType, input io.ReadCloser) error {
 	defer func() {
 		_ = input.Close()
 	}()
@@ -133,7 +133,7 @@ func (s *FsStorageDriver) WriteDatabase(dbType IpdbType, input io.ReadCloser) er
 	return nil
 }
 
-func (s *FsStorageDriver) ReadDatabase(dbType IpdbType) (io.ReadCloser, error) {
+func (s *FsStorageDriver) ReadDatabase(dbType DbType) (io.ReadCloser, error) {
 	filename, err := s.dbTypeToFilename(dbType)
 	if err != nil {
 		return nil, err

@@ -1,4 +1,4 @@
-package ipdb_geoip_tools
+package ipdb
 
 // Checkpoint is checkpoint information for a database.
 type Checkpoint struct {
