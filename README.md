@@ -2,6 +2,8 @@
 
 Self-contained IP database library for Go.
 
+**See also: [go-domaindb](https://github.com/termermc/go-domaindb)**
+
 Automatically downloads and caches various types of IP databases for local in-process querying without reaching out to external APIs.
 
 Supports the following operations:
