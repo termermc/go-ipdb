@@ -4,10 +4,6 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/oschwald/maxminddb-golang/v2"
-	errors2 "github.com/pkg/errors"
-	"github.com/puzpuzpuz/xsync/v4"
-	"github.com/yl2chen/cidranger"
 	"io"
 	"net"
 	"net/http"
@@ -17,6 +13,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/oschwald/maxminddb-golang/v2"
+	errors2 "github.com/pkg/errors"
+	"github.com/puzpuzpuz/xsync/v4"
+	"github.com/yl2chen/cidranger"
 )
 
 const defaultHttpClientTimeout = 10 * time.Second
@@ -501,7 +502,7 @@ func NewIpdb(options Options) (*Ipdb, error) {
 		}()
 	} else {
 		if err := setup(); err != nil {
-			return nil, nil
+			return nil, err
 		}
 	}
 
