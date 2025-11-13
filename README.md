@@ -8,8 +8,7 @@ Automatically downloads and caches various types of IP databases for local in-pr
 
 Supports the following operations:
  - Get ISO 3166 country code for IP address (geoIP)
- - Check if IP address is a Tor exit node
- - Check if an IP address is in a datacenter range (such as a VPN or hosting provider)
+ - Check if IP address is a range database (such as Tor exit nodes or known VPNs)
  - Optional bring-your-own download logic
  - Optional bring-your-own caching logic
 
@@ -31,7 +30,7 @@ This library is useful if:
 Add to your project by running:
 
 ```bash
-go get github.com/termermc/go-ipdb
+go get github.com/termermc/go-ipdb/v2
 ```
 
 ## Examples
@@ -56,42 +55,28 @@ if err != nil {
 println(cc) // US
 ```
 
-## Datacenter Check
+## IP Range Database Check
 
-The datacenter IP check system uses newline-separated list(s) of CIDR notation IP ranges format.
+The IP range database check system uses newline-separated list(s) of IP ranges in CIDR notation or bare IP addresses.
+Any bare IP addresses will be assumed to be `/32` for IPv4 and `/128` for IPv6.
+Bare IPs and CIDR ranges can be mixed in the same list.
+
 All lists will be loaded into the in-memory database and IPs can be checked against them.
 Multiple lists can be combined for better detection.
 
 ```go
+// Assuming you have a DB named "tor-exit" containing Tor exit node IPs
+const DbTorExit = "tor-exit"
+
 ip := netip.MustParseAddr("13.107.246.40")
 
-isDc, err := ipdb.IsIpDatacenter(ip)
+isTor, err := ipdb.IsIpInRangeDb(DbTorExit, ip)
 if err != nil {
      panic(err)
 }
 
-if isDc {
-	println("Datacenter IP detected")
-}
-```
-
-## Tor Exit Node Check
-
-The Tor IP check system uses newline-separated list(s) of CIDR notation IP ranges format, or bare IP addresses without CIDR notation.
-Any bare IP addresses will be assumed to be `/32` for IPv4 and `/128` for IPv6.
-All lists will be loaded into the in-memory database and IPs can be checked against them.
-Multiple lists can be combined for better detection.
-
-```go
-ip := netip.MustParseAddr("103.251.167.10")
-
-isTor, err := ipdb.IsIpTorExitNode(ip)
-if err != nil {
-	panic(err)
-}
-
 if isTor {
-	println("Tor exit node detected")
+	println("Tor exit node IP detected")
 }
 ```
 

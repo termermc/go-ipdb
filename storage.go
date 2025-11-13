@@ -2,8 +2,10 @@ package ipdb
 
 import (
 	"encoding/json"
-	"github.com/pkg/errors"
+	"errors"
+	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -11,14 +13,14 @@ import (
 
 // StorageDriver is an interface that stores IP databases and checkpoint data.
 type StorageDriver interface {
-	// WriteDatabase opens a database file of the specified type for writing.
+	// WriteDatabase opens the database file with the specified name for writing.
 	// The reader will be closed by the function regardless of whether an error occurs.
-	WriteDatabase(dbType DbType, input io.ReadCloser) error
+	WriteDatabase(name string, input io.ReadCloser) error
 
-	// ReadDatabase opens a database file of the specified type for reading.
+	// ReadDatabase opens the database file with the specified name for reading.
 	// The caller is expected to close the reader.
-	// If there is no cached database of the specified type, the function will return syscall.ENOENT.
-	ReadDatabase(dbType DbType) (io.ReadCloser, error)
+	// If there is no cached database with the specified name, the function will return syscall.ENOENT.
+	ReadDatabase(name string) (io.ReadCloser, error)
 
 	// WriteCheckpoints writes all checkpoints.
 	// Checkpoints must not be nil.
@@ -46,20 +48,20 @@ type FsStorageDriver struct {
 func NewFsStorageDriver(dataDir string) (*FsStorageDriver, error) {
 	absPath, err := filepath.Abs(dataDir)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to get absolute path of input path \"%s\" when creating FsStorageDriver instance", dataDir)
+		return nil, fmt.Errorf(`failed to get absolute path of input path "%s" when creating FsStorageDriver instance: %w`, dataDir, err)
 	}
 
 	stat, err := os.Stat(absPath)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
-			return nil, errors.Wrapf(err, "path \"%s\" did not exist when creating FsStorageDriver instance", absPath)
+			return nil, fmt.Errorf(`path "%s" did not exist when creating FsStorageDriver instance: %w`, absPath, err)
 		} else {
-			return nil, errors.Wrapf(err, "unexpected error statting path \"%s\" when creating FsStorageDriver instance", absPath)
+			return nil, fmt.Errorf(`unexpected error statting path "%s" when creating FsStorageDriver instance: %w`, absPath, err)
 		}
 	}
 
 	if !stat.IsDir() {
-		return nil, errors.Wrapf(syscall.ENOTDIR, "path \"%s\" did not point to a directory when creating FsStorageDriver instance", absPath)
+		return nil, fmt.Errorf(`path "%s" did not point to a directory when creating FsStorageDriver instance: %w`, absPath, err)
 	}
 
 	return &FsStorageDriver{
@@ -69,27 +71,20 @@ func NewFsStorageDriver(dataDir string) (*FsStorageDriver, error) {
 
 // Returns the filename for the specified DB type.
 // If the type valid is invalid, returns ErrInvalidIpdbType.
-func (s *FsStorageDriver) dbTypeToFilename(dbType DbType) (string, error) {
-	switch dbType {
-	case DbTypeTorExit:
-		return "tor_exit_node_ips.txt", nil
-	case DbTypeDatacenter:
-		return "datacenter_cidr_ranges.txt", nil
-	case DbTypeGeoIpv4:
-		return "geo_ipv4.mmdb", nil
-	case DbTypeGeoIpv6:
-		return "geo_ipv6.mmdb", nil
-	default:
-		return "", ErrInvalidIpdbType
+func (s *FsStorageDriver) dbNameToFilename(name string) (string, error) {
+	if len(name) > DbNameMaxSize {
+		return "", ErrDbNameTooLong
 	}
+
+	return url.QueryEscape(name), nil
 }
 
-func (s *FsStorageDriver) WriteDatabase(dbType DbType, input io.ReadCloser) error {
+func (s *FsStorageDriver) WriteDatabase(name string, input io.ReadCloser) error {
 	defer func() {
 		_ = input.Close()
 	}()
 
-	filename, err := s.dbTypeToFilename(dbType)
+	filename, err := s.dbNameToFilename(name)
 	if err != nil {
 		return err
 	}
@@ -103,7 +98,7 @@ func (s *FsStorageDriver) WriteDatabase(dbType DbType, input io.ReadCloser) erro
 	if _, err = os.Stat(filePath); err == nil {
 		err = os.Rename(filePath, bakFilePath)
 		if err != nil {
-			return errors.Wrapf(err, "failed to move existing file \"%s\" to backup path \"%s\"", filePath, bakFilePath)
+			return fmt.Errorf(`failed to move existing file "%s" to backup path "%s": %w`, filePath, bakFilePath, err)
 		}
 
 		backedUp = true
@@ -122,19 +117,19 @@ func (s *FsStorageDriver) WriteDatabase(dbType DbType, input io.ReadCloser) erro
 
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, fsPermBits)
 	if err != nil {
-		return errors.Wrapf(err, "failed to open file \"%s\" for writing database type %s", filePath, dbType.String())
+		return fmt.Errorf(`failed to open file "%s" for writing database "%s": %w`, filePath, name, err)
 	}
 
 	_, err = io.Copy(file, input)
 	if err != nil {
-		return errors.Wrapf(err, "failed to copy input to file \"%s\" for writing database type %s", filePath, dbType.String())
+		return fmt.Errorf(`failed to copy input to file "%s" for writing database "%s": %w`, filePath, name, err)
 	}
 
 	return nil
 }
 
-func (s *FsStorageDriver) ReadDatabase(dbType DbType) (io.ReadCloser, error) {
-	filename, err := s.dbTypeToFilename(dbType)
+func (s *FsStorageDriver) ReadDatabase(name string) (io.ReadCloser, error) {
+	filename, err := s.dbNameToFilename(name)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +138,7 @@ func (s *FsStorageDriver) ReadDatabase(dbType DbType) (io.ReadCloser, error) {
 
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open file \"%s\" for database type %s", filePath, dbType.String())
+		return nil, fmt.Errorf(`failed to open file "%s" for database type %s: %w`, filePath, name, err)
 	}
 
 	return file, nil
@@ -153,7 +148,7 @@ func (s *FsStorageDriver) WriteCheckpoints(checkpoints *AllCheckpoints) error {
 	filePath := filepath.Join(s.dataDir, checkpointsFilename)
 	file, err := os.OpenFile(filePath, syscall.O_CREAT|syscall.O_WRONLY, fsPermBits)
 	if err != nil {
-		return errors.Wrapf(err, "failed to open file \"%s\" for writing checkpoints", filePath)
+		return fmt.Errorf(`failed to open file "%s" for writing checkpoints: %w`, filePath, err)
 	}
 
 	defer func() {
@@ -163,7 +158,7 @@ func (s *FsStorageDriver) WriteCheckpoints(checkpoints *AllCheckpoints) error {
 	enc := json.NewEncoder(file)
 	err = enc.Encode(checkpoints)
 	if err != nil {
-		return errors.Wrapf(err, "failed to encode checkpoints to JSON file at \"%s\"", filePath)
+		return fmt.Errorf(`failed to encode checkpoints to JSON file at "%s": %w`, filePath, err)
 	}
 
 	return nil
@@ -173,14 +168,20 @@ func (s *FsStorageDriver) ReadCheckpoints() (*AllCheckpoints, error) {
 	filePath := filepath.Join(s.dataDir, checkpointsFilename)
 	file, err := os.OpenFile(filePath, syscall.O_RDONLY, 0)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open file \"%s\" for reading checkpoints", filePath)
+		return nil, fmt.Errorf(`failed to open file "%s" for reading checkpoints: %w`, filePath, err)
 	}
 
 	var res AllCheckpoints
 	dec := json.NewDecoder(file)
 	err = dec.Decode(&res)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to decode checkpoints from JSON file at \"%s\"", filePath)
+		return nil, fmt.Errorf(`failed to decode checkpoints from JSON file at "%s": %w`, filePath, err)
+	}
+
+	if res.Checkpoints == nil {
+		// Might be an old version of the file.
+		// Create an empty checkpoints map.
+		res.Checkpoints = make(map[string]Checkpoint)
 	}
 
 	return &res, nil

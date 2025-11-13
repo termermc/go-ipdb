@@ -2,12 +2,20 @@ package main
 
 import (
 	"fmt"
-	"github.com/termermc/go-ipdb"
+	"log/slog"
 	"net/netip"
 	"net/url"
 	"os"
 	"time"
+
+	"github.com/termermc/go-ipdb/v2"
 )
+
+// DbTorExit is the name of the IP range database that stores Tor exit nodes.
+const DbTorExit = "tor-exit"
+
+// DbDatacenter is the name of the IP range database that stores datacenter IPs.
+const DbDatacenter = "datacenter"
 
 func mustParseUrl(str string) *url.URL {
 	res, err := url.Parse(str)
@@ -32,12 +40,9 @@ func main() {
 		panic(err)
 	}
 
-	// Use the built-in logger.
-	// It logs to the console.
-	// Specifying nil for logLevels because we want to print all log messages of every log level.
-	// In production, you may want to exclude LogLevelDebug because it is rather verbose.
-	// If you use a specific logging system, you can implement your own Logger.
-	logger := ipdb.NewDefaultLogger(nil)
+	// Use the default structured logger.
+	// If you use a specific logger, you can pass your own *slog.Logger.
+	logger := slog.Default()
 
 	// Create the actual Ipdb instance.
 	// You may omit any of the data sources if you do not need them.
@@ -61,24 +66,26 @@ func main() {
 		// See documentation on this field for more details.
 		LoadDatabasesInBackground: false,
 
-		// For Tor exit nodes, we're using Dan's exit node list.
-		// We're also using another list from X4BNet, hosted on GitHub.
-		// If Dan's list is rate limiting us, we'll still have access to X4BNet's list.
-		// If both work, they will be merged into a single list.
-		TorExitIpsSource: &ipdb.DataSource{
-			RefreshInterval: 1 * time.Hour,
-			Urls: []*url.URL{
-				mustParseUrl("https://www.dan.me.uk/torlist/?exit"),
-				mustParseUrl("https://raw.githubusercontent.com/X4BNet/lists_torexit/refs/heads/main/ipv4.txt"),
+		RangeSources: map[string]*ipdb.DataSource{
+			// For Tor exit nodes, we're using Dan's exit node list.
+			// We're also using another list from X4BNet, hosted on GitHub.
+			// If Dan's list is rate limiting us, we'll still have access to X4BNet's list.
+			// If both work, they will be merged into a single list.
+			DbTorExit: {
+				RefreshInterval: 1 * time.Hour,
+				Urls: []*url.URL{
+					mustParseUrl("https://www.dan.me.uk/torlist/?exit"),
+					mustParseUrl("https://raw.githubusercontent.com/X4BNet/lists_torexit/refs/heads/main/ipv4.txt"),
+				},
 			},
-		},
 
-		// We're using X4BNet's datacenter and VPN lists.
-		DatacenterIpsSource: &ipdb.DataSource{
-			RefreshInterval: 1 * time.Hour,
-			Urls: []*url.URL{
-				mustParseUrl("https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/vpn/ipv4.txt"),
-				mustParseUrl("https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/datacenter/ipv4.txt"),
+			// We're using X4BNet's datacenter and VPN lists.
+			DbDatacenter: {
+				RefreshInterval: 1 * time.Hour,
+				Urls: []*url.URL{
+					mustParseUrl("https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/vpn/ipv4.txt"),
+					mustParseUrl("https://raw.githubusercontent.com/X4BNet/lists_vpn/refs/heads/main/output/datacenter/ipv4.txt"),
+				},
 			},
 		},
 
@@ -116,7 +123,7 @@ func main() {
 		"199.195.254.219", // BuyVM
 
 		// Tor exit nodes
-		"2a0d:bbc7::f816:3eff:fee6:ca14",
+		"2803:0200:ffff:ff0c::ae92:2a2f",
 		"45.84.107.101",
 		"192.42.116.194",
 	}
@@ -124,12 +131,12 @@ func main() {
 	for _, ipStr := range ips {
 		ip := netip.MustParseAddr(ipStr)
 
-		isTor, err := ipDb.IsIpTorExitNode(ip)
+		isTor, err := ipDb.IsIpInRangeDb(DbTorExit, ip)
 		if err != nil {
 			panic(err)
 		}
 
-		isDc, err := ipDb.IsIpDatacenter(ip)
+		isDc, err := ipDb.IsIpInRangeDb(DbDatacenter, ip)
 		if err != nil {
 			panic(err)
 		}
@@ -142,16 +149,16 @@ func main() {
 		fmt.Printf("%s is: tor exit node: %v, datacenter: %v, country: %s\n", ip.String(), isTor, isDc, cc)
 	}
 
+	// In this example, the program terminates.
+	// In real-world usage, the program will continue to run and databases will be updated in the background.
+	// Add `select {}` to the end of the program to leave it open for a few hours to see log messages caused by the automatic updates.
+
+	//select {}
+
 	// Closing the database frees all databases.
 	// The Ipdb instance is no longer usable after closure.
 	err = ipDb.Close()
 	if err != nil {
 		panic(err)
 	}
-
-	// In this example, the program terminates.
-	// In real-world usage, the program will continue to run and databases will be updated in the background.
-	// Add `select {}` to the end of the program to leave it open for a few hours to see log messages caused by the automatic updates.
-
-	//select {}
 }

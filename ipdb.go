@@ -2,9 +2,11 @@ package ipdb
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -15,37 +17,22 @@ import (
 	"time"
 
 	"github.com/oschwald/maxminddb-golang/v2"
-	errors2 "github.com/pkg/errors"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/yl2chen/cidranger"
 )
 
 const defaultHttpClientTimeout = 10 * time.Second
 
-// DbType is a type of IP database.
-type DbType string
-
-func (t DbType) String() string {
-	return string(t)
-}
-
-const (
-	// DbTypeTorExit is the type for the Tor exit IPs database.
-	DbTypeTorExit DbType = "Tor exit nodes"
-
-	// DbTypeDatacenter is the type for the datacenter IPs database.
-	DbTypeDatacenter DbType = "datacenter IP ranges"
-
-	// DbTypeGeoIpv4 is the type for the IPv4 to country code database.
-	DbTypeGeoIpv4 DbType = "IPv4 geolocation"
-
-	// DbTypeGeoIpv6 is the type for the IPv6 to country code database.
-	DbTypeGeoIpv6 DbType = "IPv6 geolocation"
-)
-
-type ipdbUpdate struct {
+type dbUpdate struct {
 	Ts   time.Time
-	Type DbType
+	Name string
+}
+type dbSrcRanger struct {
+	Has             bool
+	Src             *DataSource
+	Mu              *xsync.RBMutex
+	Ranger          cidranger.Ranger
+	LastUpdatedUnix int64
 }
 
 // Ipdb stores and updates IP databases.
@@ -53,7 +40,7 @@ type ipdbUpdate struct {
 // Includes functionality to:
 //   - Resolve ISO 3166 country codes for an IP address
 //   - Check if an IP address is a Tor exit node
-//   - Check if an IP address is used by a datacenter (as opposed to a residential IP)
+//   - Check if an IP address appears in a specific list of ranges.
 //
 // Databases are cached on disk and updated periodically from data sources.
 // At runtime, databases are stored in-memory.
@@ -68,28 +55,22 @@ type Ipdb struct {
 	storage    StorageDriver
 	disableDl  bool
 	httpClient *http.Client
-	logger     Logger
-	updates    chan ipdbUpdate
+	logger     *slog.Logger
+	updates    chan dbUpdate
 
-	torExitSrc    *DataSource
-	datacenterSrc *DataSource
-	geoIpv4Src    *DataSource
-	geoIpv6Src    *DataSource
+	rangeDbs map[string]*dbSrcRanger
 
-	torExitRangerMutex    *xsync.RBMutex
-	datacenterRangerMutex *xsync.RBMutex
-	geoIpv4MmdbMutex      *xsync.RBMutex
-	geoIpv6MmdbMutex      *xsync.RBMutex
+	geoIpv4Src *DataSource
+	geoIpv6Src *DataSource
 
-	torExitRanger    cidranger.Ranger
-	datacenterRanger cidranger.Ranger
-	geoIpv4Mmdb      *maxminddb.Reader
-	geoIpv6Mmdb      *maxminddb.Reader
+	geoIpv4MmdbMutex *xsync.RBMutex
+	geoIpv6MmdbMutex *xsync.RBMutex
 
-	hasTorExit    bool
-	hasDatacenter bool
-	hasGeoIpv4    bool
-	hasGeoIpv6    bool
+	geoIpv4Mmdb *maxminddb.Reader
+	geoIpv6Mmdb *maxminddb.Reader
+
+	hasGeoIpv4 bool
+	hasGeoIpv6 bool
 
 	isRunning bool
 }
@@ -118,10 +99,9 @@ type Options struct {
 	// Required.
 	StorageDriver StorageDriver
 
-	// By default, Ipdb prints log messages to stdout and stderr.
-	// If Logger is specified, it will call this function instead.
-	// Note that err may be nil.
-	Logger Logger
+	// By default, Ipdb uses slog.Default.
+	// If Logger is specified, it will use it instead.
+	Logger *slog.Logger
 
 	// Overrides the default HTTP client if not nil.
 	// If nil, uses a default HTTP client with a 10-second timeout.
@@ -138,21 +118,12 @@ type Options struct {
 	// It is NOT recommended for production.
 	//
 	// Important: Any methods on Ipdb that require databases to be initialized will fail until the databases have loaded.
-	// If this is true, you should also provide a function for the OnError field to handle errors that might occur while loading the databases in the background.
 	LoadDatabasesInBackground bool
 
-	// The source for the Tor exit nodes list.
-	// The URL must point to a file containing a newline-separated list of IP addresses (plain IP addresses like `127.0.0.1`, not CIDR with network like `127.0.0.1/8`).
+	// A mapping of database names to their underlying IP range sources.
+	// Each source's URL must point to a file containing a newline-separated list of IP addresses and/or CIDR ranges.
 	// Empty lines are ignored.
-	//
-	// Tor exit IP checking will be disabled if this field is nil.
-	TorExitIpsSource *DataSource
-
-	// The source for the datacenter IPs list.
-	// The URL must point to a file containing a newline-separated list of CIDR notation addresses (like `192.0.2.0/24` or `2001:db8::/32`)
-	// Empty lines are ignored.
-	// Datacenter IP checking will be disabled if this field is nil.
-	DatacenterIpsSource *DataSource
+	RangeSources map[string]*DataSource
 
 	// The source for the IPv4 country database.
 	// The URL must point to a MaxMindDB (.mmdb) file, containing at least the fields provided by MaxMind's GeoLite2 database.
@@ -183,11 +154,23 @@ func NewIpdb(options Options) (*Ipdb, error) {
 		httpClient = options.HttpClient
 	}
 
-	var logger Logger
+	var logger *slog.Logger
 	if options.Logger == nil {
-		logger = NewDefaultLogger(nil)
+		logger = slog.Default()
 	} else {
 		logger = options.Logger
+	}
+
+	// Create source rangers.
+	rangeDbs := make(map[string]*dbSrcRanger)
+	for name, src := range options.RangeSources {
+		rangeDbs[name] = &dbSrcRanger{
+			Has:             false,
+			Src:             src,
+			Mu:              xsync.NewRBMutex(),
+			Ranger:          cidranger.NewPCTrieRanger(),
+			LastUpdatedUnix: 0,
+		}
 	}
 
 	s := &Ipdb{
@@ -195,25 +178,23 @@ func NewIpdb(options Options) (*Ipdb, error) {
 		disableDl:  options.DisableDownload,
 		httpClient: httpClient,
 		logger:     logger,
-		updates:    make(chan ipdbUpdate, 8),
+		updates:    make(chan dbUpdate, 8),
 
-		torExitSrc:    options.TorExitIpsSource,
-		datacenterSrc: options.DatacenterIpsSource,
-		geoIpv4Src:    options.GeoIpv4Source,
-		geoIpv6Src:    options.GeoIpv6Source,
+		rangeDbs: rangeDbs,
 
-		torExitRangerMutex:    xsync.NewRBMutex(),
-		datacenterRangerMutex: xsync.NewRBMutex(),
-		geoIpv4MmdbMutex:      xsync.NewRBMutex(),
-		geoIpv6MmdbMutex:      xsync.NewRBMutex(),
+		geoIpv4Src: options.GeoIpv4Source,
+		geoIpv6Src: options.GeoIpv6Source,
+
+		geoIpv4MmdbMutex: xsync.NewRBMutex(),
+		geoIpv6MmdbMutex: xsync.NewRBMutex(),
 
 		isRunning: true,
 	}
 
-	s.logger.Log(LogLevelInfo, "initializing Ipdb", nil)
+	s.logger.Info("initializing",
+		"service", "ipdb.Ipdb",
+	)
 
-	var downloadedTorExitUnix int64
-	var downloadedDatacenterUnix int64
 	var downloadedGeoIpv4Unix int64
 	var downloadedGeoIpv6Unix int64
 
@@ -223,94 +204,62 @@ func NewIpdb(options Options) (*Ipdb, error) {
 		alreadyHadCheckpoints = true
 	} else {
 		if errors.Is(err, syscall.ENOENT) {
-			checkpoints = &AllCheckpointsDefault
+			checkpoints = &AllCheckpoints{
+				Checkpoints: make(map[string]Checkpoint),
+			}
 		} else {
-			return nil, errors2.Wrap(err, "failed to load checkpoints during initialization")
+			return nil, fmt.Errorf("failed to load checkpoints during initialization: %w", err)
 		}
 	}
 
 	setup := func() error {
 		var err error
 
-		// Read databases.
-		if !s.isRunning {
-			return nil
-		}
-		if s.torExitSrc == nil {
-			s.logger.Log(LogLevelInfo, "no data source for Tor exit nodes database; corresponding database will not be loaded", nil)
-		} else {
-			var torExitReader io.ReadCloser
-			if alreadyHadCheckpoints {
-				s.logger.Log(LogLevelDebug, "reading Tor exit nodes database from cache", nil)
-
-				torExitReader, err = s.storage.ReadDatabase(DbTypeTorExit)
-				if err != nil && !errors.Is(err, syscall.ENOENT) {
-					return errors2.Wrap(err, "failed to read Tor exit nodes database during initialization")
+		toClose := make([]io.Closer, 0, len(rangeDbs))
+		defer func() {
+			for _, c := range toClose {
+				if c != nil {
+					_ = c.Close()
 				}
-				defer func() {
-					if torExitReader != nil {
-						_ = torExitReader.Close()
-					}
-				}()
 			}
-			if torExitReader == nil {
+		}()
+
+		for name, data := range rangeDbs {
+			// Read databases.
+			if !s.isRunning {
+				return nil
+			}
+
+			var reader io.ReadCloser
+			if alreadyHadCheckpoints {
+				s.logger.Debug("reading range database from cache",
+					"service", "ipdb.Ipdb",
+					"database_name", name,
+				)
+
+				reader, err = s.storage.ReadDatabase(name)
+				if err != nil && !errors.Is(err, syscall.ENOENT) {
+					return fmt.Errorf(`failed to read database with name "%s" during initialization: %w`, name, err)
+				}
+				toClose = append(toClose, reader)
+			}
+			if reader == nil {
 				// No cached database.
 				if s.disableDl {
-					return errors2.Wrap(ErrNoCacheAndNoDownload, "cannot download tor exit nodes database")
+					return fmt.Errorf(`cannot download database with name "%s" during initialization: %w`, name, ErrNoCacheAndNoDownload)
 				}
 
 				// Try downloading it.
-				err = s.DownloadAndLoadTorExitNodeDatabase()
+				err = s.DownloadAndLoadRangeDatabase(name)
 				if err != nil {
-					return errors2.Wrap(err, "failed to download Tor exit nodes database during initialization")
+					return fmt.Errorf(`failed to download database with name "%s" during initialization: %w`, name, err)
 				}
 
-				downloadedTorExitUnix = time.Now().Unix()
+				data.LastUpdatedUnix = time.Now().Unix()
 			} else {
-				err = s.loadTorExitNodeDatabaseFromReader(torExitReader)
+				err = s.loadRangesFromReader(reader, name)
 				if err != nil {
-					return errors2.Wrap(err, "failed to load Tor exit nodes database during initialization")
-				}
-			}
-		}
-
-		if !s.isRunning {
-			return nil
-		}
-		if s.datacenterSrc == nil {
-			s.logger.Log(LogLevelInfo, "no data source for datacenter ranges database; corresponding database will not be loaded", nil)
-		} else {
-			var dcRangesReader io.ReadCloser
-			if alreadyHadCheckpoints {
-				s.logger.Log(LogLevelDebug, "reading datacenter ranges database from cache", nil)
-
-				dcRangesReader, err = s.storage.ReadDatabase(DbTypeDatacenter)
-				if err != nil && !errors.Is(err, syscall.ENOENT) {
-					return errors2.Wrap(err, "failed to read datacenter ranges database during initialization")
-				}
-				defer func() {
-					if dcRangesReader != nil {
-						_ = dcRangesReader.Close()
-					}
-				}()
-			}
-			if dcRangesReader == nil {
-				// No cached database.
-				if s.disableDl {
-					return errors2.Wrap(ErrNoCacheAndNoDownload, "cannot download datacenter ranges database")
-				}
-
-				// Try downloading it.
-				err = s.DownloadAndLoadDatacenterRangesDatabase()
-				if err != nil {
-					return errors2.Wrap(err, "failed to download datacenter ranges database during initialization")
-				}
-
-				downloadedDatacenterUnix = time.Now().Unix()
-			} else {
-				err = s.loadDatacenterRangesFromReader(dcRangesReader)
-				if err != nil {
-					return errors2.Wrap(err, "failed to load datacenter ranges database during initialization")
+					return fmt.Errorf(`failed to load database with name "%s" during initialization: %w`, name, err)
 				}
 			}
 		}
@@ -319,15 +268,19 @@ func NewIpdb(options Options) (*Ipdb, error) {
 			return nil
 		}
 		if s.geoIpv4Src == nil {
-			s.logger.Log(LogLevelInfo, "no data source for geo IPv4 database; corresponding database will not be loaded", nil)
+			s.logger.Info("no data source for geo IPv4 database; corresponding database will not be loaded",
+				"service", "ipdb.Ipdb",
+			)
 		} else {
 			var geoIpv4Reader io.ReadCloser
 			if alreadyHadCheckpoints {
-				s.logger.Log(LogLevelDebug, "reading geo IPv4 database from cache", nil)
+				s.logger.Debug("reading geo IPv4 database from cache",
+					"service", "ipdb.Ipdb",
+				)
 
-				geoIpv4Reader, err = s.storage.ReadDatabase(DbTypeGeoIpv4)
+				geoIpv4Reader, err = s.storage.ReadDatabase(DbNameGeoIpv4)
 				if err != nil && !errors.Is(err, syscall.ENOENT) {
-					return errors2.Wrap(err, "failed to read geo IPv4 database during initialization")
+					return fmt.Errorf("failed to read geo IPv4 database during initialization: %w", err)
 				}
 				defer func() {
 					if geoIpv4Reader != nil {
@@ -338,20 +291,20 @@ func NewIpdb(options Options) (*Ipdb, error) {
 			if geoIpv4Reader == nil {
 				// No cached database.
 				if s.disableDl {
-					return errors2.Wrap(ErrNoCacheAndNoDownload, "cannot download geo IPv4 database")
+					return fmt.Errorf("cannot download geo IPv4 database: %w", ErrNoCacheAndNoDownload)
 				}
 
 				// Try downloading it.
 				err = s.DownloadAndLoadGeoIpv4Mmdb()
 				if err != nil {
-					return errors2.Wrap(err, "failed to download geo IPv4 database during initialization")
+					return fmt.Errorf("failed to download geo IPv4 database during initialization: %w", err)
 				}
 
 				downloadedGeoIpv4Unix = time.Now().Unix()
 			} else {
-				err = s.loadGeoIpMmdbFromReader(geoIpv4Reader, DbTypeGeoIpv4)
+				err = s.loadGeoIpMmdbFromReader(geoIpv4Reader, 4)
 				if err != nil {
-					return errors2.Wrap(err, "failed to load geo IPv4 database during initialization")
+					return fmt.Errorf("failed to load geo IPv4 database during initialization: %w", err)
 				}
 			}
 		}
@@ -360,15 +313,19 @@ func NewIpdb(options Options) (*Ipdb, error) {
 			return nil
 		}
 		if s.geoIpv6Src == nil {
-			s.logger.Log(LogLevelInfo, "no data source for geo IPv6 database; corresponding database will not be loaded", nil)
+			s.logger.Info("no data source for geo IPv6 database; corresponding database will not be loaded",
+				"service", "ipdb.Ipdb",
+			)
 		} else {
 			var geoIpv6Reader io.ReadCloser
 			if alreadyHadCheckpoints {
-				s.logger.Log(LogLevelDebug, "reading geo IPv6 database from cache", nil)
+				s.logger.Debug("reading geo IPv6 database from cache",
+					"service", "ipdb.Ipdb",
+				)
 
-				geoIpv6Reader, err = s.storage.ReadDatabase(DbTypeGeoIpv6)
+				geoIpv6Reader, err = s.storage.ReadDatabase(DbNameGeoIpv6)
 				if err != nil && !errors.Is(err, syscall.ENOENT) {
-					return errors2.Wrap(err, "failed to read geo IPv6 database during initialization")
+					return fmt.Errorf("failed to read geo IPv6 database during initialization: %w", err)
 				}
 				defer func() {
 					if geoIpv6Reader != nil {
@@ -379,20 +336,20 @@ func NewIpdb(options Options) (*Ipdb, error) {
 			if geoIpv6Reader == nil {
 				// No cached database.
 				if s.disableDl {
-					return errors2.Wrap(ErrNoCacheAndNoDownload, "cannot download geo IPv6 database")
+					return fmt.Errorf("cannot download geo IPv6 database: %w", ErrNoCacheAndNoDownload)
 				}
 
 				// Try downloading it.
 				err = s.DownloadAndLoadGeoIpv6Mmdb()
 				if err != nil {
-					return errors2.Wrap(err, "failed to download geo IPv6 database during initialization")
+					return fmt.Errorf("failed to download geo IPv6 database during initialization: %w", err)
 				}
 
 				downloadedGeoIpv6Unix = time.Now().Unix()
 			} else {
-				err = s.loadGeoIpMmdbFromReader(geoIpv6Reader, DbTypeGeoIpv6)
+				err = s.loadGeoIpMmdbFromReader(geoIpv6Reader, 6)
 				if err != nil {
-					return errors2.Wrap(err, "failed to load geo IPv6 database during initialization")
+					return fmt.Errorf("failed to load geo IPv6 database during initialization: %w", err)
 				}
 			}
 		}
@@ -401,24 +358,61 @@ func NewIpdb(options Options) (*Ipdb, error) {
 			return nil
 		}
 
-		if downloadedTorExitUnix != 0 {
-			checkpoints.TorExitDb.LastUpdatedUnix = downloadedTorExitUnix
+		// Populate checkpoints as needed.
+		for name, data := range rangeDbs {
+			var chkPnt Checkpoint
+			var has bool
+			chkPnt, has = checkpoints.Checkpoints[name]
+			if !has {
+				chkPnt = Checkpoint{
+					LastUpdatedUnix: 0,
+				}
+			}
+
+			if data.LastUpdatedUnix != 0 {
+				chkPnt.LastUpdatedUnix = data.LastUpdatedUnix
+			}
+
+			checkpoints.Checkpoints[name] = chkPnt
 		}
-		if downloadedDatacenterUnix != 0 {
-			checkpoints.DatacenterDb.LastUpdatedUnix = downloadedDatacenterUnix
+		{
+			var chkPnt Checkpoint
+			var has bool
+			chkPnt, has = checkpoints.Checkpoints[DbNameGeoIpv4]
+			if !has {
+				chkPnt = Checkpoint{
+					LastUpdatedUnix: 0,
+				}
+			}
+
+			if downloadedGeoIpv4Unix != 0 {
+				chkPnt.LastUpdatedUnix = downloadedGeoIpv4Unix
+			}
+
+			checkpoints.Checkpoints[DbNameGeoIpv4] = chkPnt
 		}
-		if downloadedGeoIpv4Unix != 0 {
-			checkpoints.GeoIpv4Db.LastUpdatedUnix = downloadedGeoIpv4Unix
-		}
-		if downloadedGeoIpv6Unix != 0 {
-			checkpoints.GeoIpv6Db.LastUpdatedUnix = downloadedGeoIpv6Unix
+		{
+			var chkPnt Checkpoint
+			var has bool
+			chkPnt, has = checkpoints.Checkpoints[DbNameGeoIpv6]
+			if !has {
+				chkPnt = Checkpoint{
+					LastUpdatedUnix: 0,
+				}
+			}
+
+			if downloadedGeoIpv6Unix != 0 {
+				chkPnt.LastUpdatedUnix = downloadedGeoIpv6Unix
+			}
+
+			checkpoints.Checkpoints[DbNameGeoIpv6] = chkPnt
 		}
 
 		// Save checkpoints.
 		// This is necessary because there could have been database downloads, or checkpoints have never been saved.
 		err = s.storage.WriteCheckpoints(checkpoints)
 		if err != nil {
-			return errors2.Wrap(err, "failed to save checkpoints after initial load")
+			return fmt.Errorf("failed to save checkpoints after initial load: %w", err)
 		}
 
 		if !s.isRunning {
@@ -428,76 +422,74 @@ func NewIpdb(options Options) (*Ipdb, error) {
 		// In the background, save checkpoint updates.
 		go func() {
 			for update := range s.updates {
-				switch update.Type {
-				case DbTypeTorExit:
-					checkpoints.TorExitDb.LastUpdatedUnix = update.Ts.Unix()
-					break
-				case DbTypeDatacenter:
-					checkpoints.DatacenterDb.LastUpdatedUnix = update.Ts.Unix()
-					break
-				case DbTypeGeoIpv4:
-					checkpoints.GeoIpv4Db.LastUpdatedUnix = update.Ts.Unix()
-					break
-				case DbTypeGeoIpv6:
-					checkpoints.GeoIpv6Db.LastUpdatedUnix = update.Ts.Unix()
-					break
-				default:
-					s.logger.Log(LogLevelError, fmt.Sprintf("received checkpoint update for unknown database type \"%s\", this is a bug in the library", update.Type), nil)
+				var chkPnt Checkpoint
+				var has bool
+				chkPnt, has = checkpoints.Checkpoints[update.Name]
+				if has {
+					chkPnt.LastUpdatedUnix = update.Ts.Unix()
+				} else {
+					chkPnt = Checkpoint{
+						LastUpdatedUnix: update.Ts.Unix(),
+					}
 				}
+				checkpoints.Checkpoints[update.Name] = chkPnt
 
 				err := s.storage.WriteCheckpoints(checkpoints)
 				if err != nil {
-					s.logger.Log(LogLevelError, fmt.Sprintf("failed to save checkpoints after receiving checkpoint update for %s database", update.Type), err)
+					s.logger.Error("failed to save checkpoints after receiving checkpoint update",
+						"service", "ipdb.Ipdb",
+						"database_name", update.Name,
+						"error", err,
+					)
 				}
 			}
 		}()
 
 		if !s.disableDl {
 			// Start updaters for enabled databases.
-			if s.torExitSrc != nil {
+			for name, data := range rangeDbs {
+				chkPnt := checkpoints.Checkpoints[name]
 				go s.runUpdater(
-					time.Unix(checkpoints.TorExitDb.LastUpdatedUnix, 0),
-					s.torExitSrc.RefreshInterval,
-					DbTypeTorExit,
-					s.DownloadAndLoadTorExitNodeDatabase,
+					name,
+					time.Unix(chkPnt.LastUpdatedUnix, 0),
+					data.Src.RefreshInterval,
 				)
 			}
-			if s.datacenterSrc != nil {
+			{
+				chkPnt := checkpoints.Checkpoints[DbNameGeoIpv4]
 				go s.runUpdater(
-					time.Unix(checkpoints.DatacenterDb.LastUpdatedUnix, 0),
-					s.datacenterSrc.RefreshInterval,
-					DbTypeDatacenter,
-					s.DownloadAndLoadDatacenterRangesDatabase,
-				)
-			}
-			if s.geoIpv4Src != nil {
-				go s.runUpdater(
-					time.Unix(checkpoints.GeoIpv4Db.LastUpdatedUnix, 0),
+					DbNameGeoIpv4,
+					time.Unix(chkPnt.LastUpdatedUnix, 0),
 					s.geoIpv4Src.RefreshInterval,
-					DbTypeGeoIpv4,
-					s.DownloadAndLoadGeoIpv4Mmdb,
 				)
 			}
-			if s.geoIpv6Src != nil {
+			{
+				chkPnt := checkpoints.Checkpoints[DbNameGeoIpv6]
 				go s.runUpdater(
-					time.Unix(checkpoints.GeoIpv6Db.LastUpdatedUnix, 0),
+					DbNameGeoIpv6,
+					time.Unix(chkPnt.LastUpdatedUnix, 0),
 					s.geoIpv6Src.RefreshInterval,
-					DbTypeGeoIpv6,
-					s.DownloadAndLoadGeoIpv6Mmdb,
 				)
 			}
 		}
 
-		s.logger.Log(LogLevelInfo, "finished initializing Ipdb", nil)
+		s.logger.Info("finished initializing Ipdb",
+			"service", "ipdb.Ipdb",
+		)
 
 		return nil
 	}
 
 	if options.LoadDatabasesInBackground {
-		s.logger.Log(LogLevelDebug, "loading databases in the background, as requested by Ipdb options", nil)
+		s.logger.Debug("loading databases in the background, as requested by Ipdb options",
+			"service", "ipdb.Ipdb",
+		)
 		go func() {
 			if err := setup(); err != nil {
-				s.logger.Log(LogLevelError, "failed to initialize Ipdb in the background", err)
+				s.logger.Error("failed to initialize Ipdb in the background",
+					"service", "ipdb.Ipdb",
+					"error", err,
+				)
 			}
 		}()
 	} else {
@@ -510,24 +502,36 @@ func NewIpdb(options Options) (*Ipdb, error) {
 }
 
 // runUpdater runs the updater for the specified DB type.
-func (s *Ipdb) runUpdater(lastUpdate time.Time, updateInterval time.Duration, dbType DbType, updateFunc func() error) {
+func (s *Ipdb) runUpdater(name string, lastUpdate time.Time, updateInterval time.Duration) {
 	if !s.isRunning {
 		return
 	}
 
-	s.logger.Log(LogLevelDebug, fmt.Sprintf("running updater for %s database", dbType.String()), nil)
+	s.logger.Debug("running updater for database",
+		"service", "ipdb.Ipdb",
+		"database_name", name,
+	)
 
 	update := func() error {
-		if err := updateFunc(); err != nil {
+		var err error
+		switch name {
+		case DbNameGeoIpv4:
+			err = s.DownloadAndLoadGeoIpv4Mmdb()
+		case DbNameGeoIpv6:
+			err = s.DownloadAndLoadGeoIpv6Mmdb()
+		default:
+			err = s.DownloadAndLoadRangeDatabase(name)
+		}
+		if err != nil {
 			return err
 		}
 
 		if !s.isRunning {
 			return ErrIpdbClosed
 		}
-		s.updates <- ipdbUpdate{
+		s.updates <- dbUpdate{
 			Ts:   time.Now(),
-			Type: dbType,
+			Name: name,
 		}
 
 		// Databases are big, and we want to limit the amount of garbage in memory.
@@ -548,7 +552,11 @@ func (s *Ipdb) runUpdater(lastUpdate time.Time, updateInterval time.Duration, db
 
 	err := update()
 	if err != nil {
-		s.logger.Log(LogLevelError, fmt.Sprintf("failed to do first scheduled update of %s database", dbType.String()), err)
+		s.logger.Error("failed to do first scheduled update of database",
+			"service", "ipdb.Ipdb",
+			"database_name", name,
+			"error", err,
+		)
 	}
 
 	ticker := time.NewTicker(updateInterval)
@@ -560,7 +568,11 @@ func (s *Ipdb) runUpdater(lastUpdate time.Time, updateInterval time.Duration, db
 
 		err = update()
 		if err != nil {
-			s.logger.Log(LogLevelError, fmt.Sprintf("failed to do scheduled update of %s database", dbType.String()), err)
+			s.logger.Error("failed to do scheduled update of database",
+				"service", "ipdb.Ipdb",
+				"database_name", name,
+				"error", err,
+			)
 		}
 	}
 }
@@ -572,15 +584,19 @@ func (s *Ipdb) openDataSource(src *DataSource) (io.ReadCloser, error) {
 	var reader io.ReadCloser
 
 	if src.Get != nil {
-		s.logger.Log(LogLevelDebug, "starting download of database with source Get function", nil)
+		s.logger.Debug("starting download of database with source Get function",
+			"service", "ipdb.Ipdb",
+		)
 
 		var err error
 		reader, err = src.Get()
 		if err != nil {
-			return nil, errors2.Wrap(err, "failed to get database (source Get function)")
+			return nil, fmt.Errorf("failed to get database (source Get function): %w", err)
 		}
 
-		s.logger.Log(LogLevelDebug, "finished download of database with source Get function", nil)
+		s.logger.Debug("finished download of database with source Get function",
+			"service", "ipdb.Ipdb",
+		)
 	} else if len(src.Urls) > 0 {
 		pipeReader, pipeWriter := io.Pipe()
 
@@ -592,16 +608,21 @@ func (s *Ipdb) openDataSource(src *DataSource) (io.ReadCloser, error) {
 
 			for _, srcUrl := range src.Urls {
 				func() {
-					s.logger.Log(LogLevelDebug, fmt.Sprintf("starting download of database with source URL \"%s\"", srcUrl), nil)
+					s.logger.Debug("starting download of database",
+						"service", "ipdb.Ipdb",
+						"source_url", srcUrl.String(),
+					)
 					req := &http.Request{
 						Method: http.MethodGet,
 						URL:    srcUrl,
 					}
 					resp, err = s.httpClient.Do(req)
 					if err != nil {
-						msg := fmt.Sprintf("failed to download database (source URL \"%s\")", srcUrl)
-						failures = append(failures, errors2.Wrap(err, msg))
-						s.logger.Log(LogLevelError, msg, err)
+						failures = append(failures, fmt.Errorf(`ipdb: failed to download database (source URL "%s"): %w`, srcUrl, err))
+						s.logger.Error("failed to download database",
+							"service", "ipdb.Ipdb",
+							"error", err,
+						)
 						return
 					}
 
@@ -614,21 +635,33 @@ func (s *Ipdb) openDataSource(src *DataSource) (io.ReadCloser, error) {
 						// Try to read first N bytes of body to get a better error message.
 						bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, bodyPreviewBytes))
 
-						msg := fmt.Sprintf("failed to download database (source URL \"%s\") because status code was %d (expected 200): %s", srcUrl, resp.StatusCode, string(bodyBytes))
-						failures = append(failures, errors2.Wrap(err, msg))
-						s.logger.Log(LogLevelError, msg, err)
+						failures = append(failures, fmt.Errorf(`ipdb: failed to download database (source URL "%s") because status code was %d (expected 200): %s: %w`, srcUrl, resp.StatusCode, string(bodyBytes), err))
+						s.logger.Error("failed to download database due to unexpected status code",
+							"service", "ipdb.Ipdb",
+							"source_url", srcUrl,
+							"status_code", resp.StatusCode,
+							"expected_status_code", http.StatusOK,
+							"body", string(bodyBytes),
+						)
 						return
 					}
 
 					bytesWritten, err := io.Copy(pipeWriter, resp.Body)
 					if err != nil {
-						msg := fmt.Sprintf("error while reading database (source URL \"%s\", bytes written: %d)", srcUrl, bytesWritten)
-						failures = append(failures, errors2.Wrap(err, msg))
-						s.logger.Log(LogLevelError, msg, err)
+						failures = append(failures, fmt.Errorf(`ipdb: error while reading database (source URL "%s", bytes written: %d): %w`, srcUrl, bytesWritten, err))
+						s.logger.Error("error while reading database",
+							"service", "ipdb.Ipdb",
+							"error", err,
+							"source_url", srcUrl,
+							"bytes_written", bytesWritten,
+						)
 						return
 					}
 
-					s.logger.Log(LogLevelDebug, fmt.Sprintf("finished download of database with source URL \"%s\"", srcUrl), nil)
+					s.logger.Debug("finished download of database",
+						"service", "ipdb.Ipdb",
+						"source_url", srcUrl,
+					)
 				}()
 
 				// Write a newline to ensure the next URL body is read on a new line.
@@ -652,11 +685,13 @@ func (s *Ipdb) openDataSource(src *DataSource) (io.ReadCloser, error) {
 	return reader, nil
 }
 
-// loadRangesFromReader reads all IP addresses and CIDR ranges from the reader and inserts them into the specified ranger.
-// Calls assignFunc with the ranger after reading all IP addresses and CIDR ranges.
+// loadRangesFromReader reads all IP addresses and CIDR ranges from the reader and inserts them into the database with the specified name.
 // Any bare IP addresses without a CIDR range will be treated as /32 for IPv4 and /128 for IPv6.
 // Does not close the reader.
-func (s *Ipdb) loadRangesFromReader(reader io.Reader, assignFunc func(ranger cidranger.Ranger)) error {
+// Assumes the database name exists, panics if not; checking the database name is the responsibility of the caller.
+func (s *Ipdb) loadRangesFromReader(reader io.Reader, name string) error {
+	data := s.rangeDbs[name]
+
 	ranger := cidranger.NewPCTrieRanger()
 	var err error
 
@@ -681,8 +716,13 @@ func (s *Ipdb) loadRangesFromReader(reader io.Reader, assignFunc func(ranger cid
 			_, ipNet, err = net.ParseCIDR(line)
 			if err != nil {
 				msg := fmt.Sprintf("failed to parse CIDR range \"%s\"", line)
-				s.logger.Log(LogLevelError, msg, err)
-				failErr := errors2.Wrap(err, msg)
+				s.logger.Error(msg,
+					"service", "ipdb.Ipdb",
+					"database_name", name,
+					"line", line,
+					"error", err,
+				)
+				failErr := fmt.Errorf("ipdb: %s: %w", msg, err)
 				failures = append(failures, failErr)
 				continue
 			}
@@ -691,8 +731,13 @@ func (s *Ipdb) loadRangesFromReader(reader io.Reader, assignFunc func(ranger cid
 			addr, err := netip.ParseAddr(line)
 			if err != nil {
 				msg := fmt.Sprintf("failed to parse bare IP address \"%s\"", line)
-				failErr := errors2.Wrap(err, msg)
-				s.logger.Log(LogLevelError, msg, err)
+				s.logger.Error(msg,
+					"service", "ipdb.Ipdb",
+					"database_name", name,
+					"line", line,
+					"error", err,
+				)
+				failErr := fmt.Errorf("ipdb: %s: %w", msg, err)
 				failures = append(failures, failErr)
 				continue
 			}
@@ -717,110 +762,114 @@ func (s *Ipdb) loadRangesFromReader(reader io.Reader, assignFunc func(ranger cid
 
 		err = ranger.Insert(cidranger.NewBasicRangerEntry(*ipNet))
 		if err != nil {
-			return errors2.Wrapf(err, "failed to insert datacenter IP range \"%s\"", line)
+			return fmt.Errorf("ipdb: failed to insert IP range \"%s\" into database \"%s\": %w", line, name, err)
 		}
 
 		goodLines++
 	}
 
 	if len(failures) > goodLines {
-		return errors2.Wrapf(errors.Join(failures...), "encountered %d parse failures while loading datacenter ranges, but only %d lines were successfully parsed. file is probably malformed; expected newline-separated list of CIDR ranges or bare IP addresses. this error wraps the encountered parse errors.", len(failures), goodLines)
+		return fmt.Errorf("encountered %d parse failures while loading ranges for database \"%s\", but only %d lines were successfully parsed. file is probably malformed; expected newline-separated list of CIDR ranges or bare IP addresses. this error wraps the encountered parse errors. error(s): %w", len(failures), name, goodLines, errors.Join(failures...))
 	}
 
-	assignFunc(ranger)
-
-	return nil
-}
-
-func (s *Ipdb) torExitAssignFunc(ranger cidranger.Ranger) {
-	s.torExitRangerMutex.Lock()
-	s.torExitRanger = ranger
-	s.hasTorExit = true
-	s.torExitRangerMutex.Unlock()
-}
-func (s *Ipdb) dcRangesAssignFunc(ranger cidranger.Ranger) {
-	s.datacenterRangerMutex.Lock()
-	s.datacenterRanger = ranger
-	s.hasDatacenter = true
-	s.datacenterRangerMutex.Unlock()
-}
-
-// Does not close the reader.
-func (s *Ipdb) loadTorExitNodeDatabaseFromReader(reader io.Reader) error {
-	err := s.loadRangesFromReader(reader, s.torExitAssignFunc)
-	if err != nil {
-		return errors2.Wrap(err, "failed to load Tor exit node database from reader")
-	}
+	data.Mu.Lock()
+	data.Has = true
+	data.Ranger = ranger
+	data.Mu.Unlock()
 
 	return nil
 }
 
 // Does not close the reader.
-func (s *Ipdb) loadDatacenterRangesFromReader(reader io.Reader) error {
-	err := s.loadRangesFromReader(reader, s.dcRangesAssignFunc)
-	if err != nil {
-		return errors2.Wrap(err, "failed to load datacenter ranges from reader")
-	}
-	return nil
-}
-
-// Does not close the reader.
-func (s *Ipdb) loadGeoIpMmdbFromReader(reader io.Reader, dbType DbType) error {
-	s.logger.Log(LogLevelDebug, fmt.Sprintf("loading %s database", dbType.String()), nil)
+// IP version must be 4 or 6.
+// If not 4 or 6, defaults to 4.
+func (s *Ipdb) loadGeoIpMmdbFromReader(reader io.Reader, ipVersion int) error {
+	s.logger.Debug("loading geoIP database",
+		"service", "ipdb.Ipdb",
+		"ip_version", ipVersion,
+	)
 
 	// Buffer the entire file into memory.
 	geoIpMmdbBytes, err := io.ReadAll(reader)
 	if err != nil {
-		return errors2.Wrap(err, "failed to read GeoIP database")
+		return fmt.Errorf("failed to read GeoIP database: %w", err)
 	}
 
-	db, err := maxminddb.FromBytes(geoIpMmdbBytes)
+	db, err := maxminddb.OpenBytes(geoIpMmdbBytes)
 	if err != nil {
-		return errors2.Wrap(err, "failed to parse GeoIP database")
+		return fmt.Errorf("failed to parse GeoIP database: %w", err)
 	}
 
-	if dbType == DbTypeGeoIpv4 {
-		s.geoIpv4MmdbMutex.Lock()
-		s.geoIpv4Mmdb = db
-		s.hasGeoIpv4 = true
-		s.geoIpv4MmdbMutex.Unlock()
-	} else {
+	if ipVersion == 6 {
 		s.geoIpv6MmdbMutex.Lock()
-		s.geoIpv6Mmdb = db
 		s.hasGeoIpv6 = true
+		if s.geoIpv6Mmdb != nil {
+			err = s.geoIpv6Mmdb.Close()
+			if err != nil {
+				s.logger.Error("failed to close old GeoIPv6 MMDB database",
+					"service", "ipdb.Ipdb",
+					"error", err,
+				)
+			}
+		}
+		s.geoIpv6Mmdb = db
 		s.geoIpv6MmdbMutex.Unlock()
+	} else {
+		s.geoIpv4MmdbMutex.Lock()
+		s.hasGeoIpv4 = true
+		if s.geoIpv4Mmdb != nil {
+			err = s.geoIpv4Mmdb.Close()
+			if err != nil {
+				s.logger.Error("failed to close old GeoIPv4 MMDB database",
+					"service", "ipdb.Ipdb",
+					"error", err,
+				)
+			}
+		}
+		s.geoIpv4Mmdb = db
+		s.geoIpv4MmdbMutex.Unlock()
 	}
 
 	return nil
 }
 
-// DownloadAndLoadTorExitNodeDatabase downloads the Tor exit node database and loads it into memory.
+// DownloadAndLoadRangeDatabase downloads the database with the specified name and loads it into memory.
 // You most likely do not need to call this function, as loading databases is handled automatically by the Ipdb instance.
-func (s *Ipdb) DownloadAndLoadTorExitNodeDatabase() error {
-	s.logger.Log(LogLevelDebug, "downloading and loading Tor exit node database", nil)
+func (s *Ipdb) DownloadAndLoadRangeDatabase(name string) error {
+	ctx := context.Background()
 
-	reader, err := s.openDataSource(s.torExitSrc)
+	data, has := s.rangeDbs[name]
+	if !has {
+		return NewNoSuchDatabaseError(name)
+	}
+
+	s.logger.Log(ctx, slog.LevelDebug, "downloading and loading randge database",
+		"service", "ipdb.Ipdb",
+		"database_name", name,
+	)
+
+	reader, err := s.openDataSource(data.Src)
 	defer func() {
 		if reader != nil {
 			_ = reader.Close()
 		}
 	}()
 	if err != nil {
-		return errors2.Wrap(err, "failed to read from Tor exit node database source")
+		return fmt.Errorf(`failed to read from source of data with name "%s": %w`, name, err)
 	}
 
 	pipeReader, pipeWriter := io.Pipe()
 
 	writeErrChan := make(chan error, 1)
 	go func() {
-		writeErrChan <- s.storage.WriteDatabase(DbTypeTorExit, pipeReader)
+		writeErrChan <- s.storage.WriteDatabase(name, pipeReader)
 	}()
 
 	parseReader := noOpReadCloser{io.TeeReader(reader, pipeWriter)}
 
-	err = s.loadTorExitNodeDatabaseFromReader(parseReader)
+	err = s.loadRangesFromReader(parseReader, name)
 	if err != nil {
-		wrapped := errors2.Wrap(err, "failed to parse Tor exit node database")
+		wrapped := fmt.Errorf(`failed to parse database with name "%s": %w`, name, err)
 		_ = pipeWriter.CloseWithError(wrapped)
 		return wrapped
 	}
@@ -828,47 +877,7 @@ func (s *Ipdb) DownloadAndLoadTorExitNodeDatabase() error {
 	_ = pipeWriter.Close()
 
 	if err := <-writeErrChan; err != nil {
-		return errors2.Wrap(err, "failed to write Tor exit node database")
-	}
-
-	return nil
-}
-
-// DownloadAndLoadDatacenterRangesDatabase downloads the datacenter ranges database and loads it into memory.
-// You most likely do not need to call this function, as loading databases is handled automatically by the Ipdb instance.
-func (s *Ipdb) DownloadAndLoadDatacenterRangesDatabase() error {
-	s.logger.Log(LogLevelDebug, "downloading and loading datacenter ranges database", nil)
-
-	reader, err := s.openDataSource(s.datacenterSrc)
-	defer func() {
-		if reader != nil {
-			_ = reader.Close()
-		}
-	}()
-	if err != nil {
-		return errors2.Wrap(err, "failed to read from datacenter ranges database source")
-	}
-
-	pipeReader, pipeWriter := io.Pipe()
-
-	writeErrChan := make(chan error)
-	go func() {
-		writeErrChan <- s.storage.WriteDatabase(DbTypeDatacenter, pipeReader)
-	}()
-
-	parseReader := noOpReadCloser{io.TeeReader(reader, pipeWriter)}
-
-	err = s.loadDatacenterRangesFromReader(parseReader)
-	if err != nil {
-		wrapped := errors2.Wrap(err, "failed to parse datacenter ranges database")
-		_ = pipeWriter.CloseWithError(wrapped)
-		return wrapped
-	}
-
-	_ = pipeWriter.Close()
-
-	if err := <-writeErrChan; err != nil {
-		return errors2.Wrap(err, "failed to write datacenter ranges database")
+		return fmt.Errorf(`failed to write database with name "%s": %w`, name, err)
 	}
 
 	return nil
@@ -877,7 +886,9 @@ func (s *Ipdb) DownloadAndLoadDatacenterRangesDatabase() error {
 // DownloadAndLoadGeoIpv4Mmdb downloads the GeoIPv4 MMDB and loads it into memory.
 // You most likely do not need to call this function, as loading databases is handled automatically by the Ipdb instance.
 func (s *Ipdb) DownloadAndLoadGeoIpv4Mmdb() error {
-	s.logger.Log(LogLevelDebug, "downloading and loading GeoIPv4 MMDB", nil)
+	s.logger.Debug("downloading and loading GeoIPv4 MMDB",
+		"service", "ipdb.Ipdb",
+	)
 
 	reader, err := s.openDataSource(s.geoIpv4Src)
 	defer func() {
@@ -886,21 +897,21 @@ func (s *Ipdb) DownloadAndLoadGeoIpv4Mmdb() error {
 		}
 	}()
 	if err != nil {
-		return errors2.Wrap(err, "failed to read from GeoIPv4 MMDB source")
+		return fmt.Errorf("failed to read from GeoIPv4 MMDB source: %w", err)
 	}
 
 	pipeReader, pipeWriter := io.Pipe()
 
 	writeErrChan := make(chan error)
 	go func() {
-		writeErrChan <- s.storage.WriteDatabase(DbTypeGeoIpv4, pipeReader)
+		writeErrChan <- s.storage.WriteDatabase(DbNameGeoIpv4, pipeReader)
 	}()
 
 	parseReader := noOpReadCloser{io.TeeReader(reader, pipeWriter)}
 
-	err = s.loadGeoIpMmdbFromReader(parseReader, DbTypeGeoIpv4)
+	err = s.loadGeoIpMmdbFromReader(parseReader, 4)
 	if err != nil {
-		wrapped := errors2.Wrap(err, "failed to parse GeoIPv4 MMDB database")
+		wrapped := fmt.Errorf("failed to parse GeoIPv4 MMDB database: %w", err)
 		_ = pipeWriter.CloseWithError(wrapped)
 		return wrapped
 	}
@@ -908,7 +919,7 @@ func (s *Ipdb) DownloadAndLoadGeoIpv4Mmdb() error {
 	_ = pipeWriter.Close()
 
 	if err := <-writeErrChan; err != nil {
-		return errors2.Wrap(err, "failed to write GeoIPv4 MMDB database")
+		return fmt.Errorf("failed to write GeoIPv4 MMDB database: %w", err)
 	}
 
 	return nil
@@ -917,7 +928,9 @@ func (s *Ipdb) DownloadAndLoadGeoIpv4Mmdb() error {
 // DownloadAndLoadGeoIpv6Mmdb downloads the GeoIPv6 MMDB and loads it into memory.
 // You most likely do not need to call this function, as loading databases is handled automatically by the Ipdb instance.
 func (s *Ipdb) DownloadAndLoadGeoIpv6Mmdb() error {
-	s.logger.Log(LogLevelDebug, "downloading and loading GeoIPv6 MMDB", nil)
+	s.logger.Debug("downloading and loading GeoIPv6 MMDB",
+		"service", "ipdb.Ipdb",
+	)
 
 	reader, err := s.openDataSource(s.geoIpv6Src)
 	defer func() {
@@ -926,21 +939,21 @@ func (s *Ipdb) DownloadAndLoadGeoIpv6Mmdb() error {
 		}
 	}()
 	if err != nil {
-		return errors2.Wrap(err, "failed to read from GeoIPv6 MMDB source")
+		return fmt.Errorf("failed to read from GeoIPv6 MMDB source: %w", err)
 	}
 
 	pipeReader, pipeWriter := io.Pipe()
 
 	writeErrChan := make(chan error)
 	go func() {
-		writeErrChan <- s.storage.WriteDatabase(DbTypeGeoIpv6, pipeReader)
+		writeErrChan <- s.storage.WriteDatabase(DbNameGeoIpv6, pipeReader)
 	}()
 
 	parseReader := noOpReadCloser{io.TeeReader(reader, pipeWriter)}
 
-	err = s.loadGeoIpMmdbFromReader(parseReader, DbTypeGeoIpv6)
+	err = s.loadGeoIpMmdbFromReader(parseReader, 6)
 	if err != nil {
-		wrapped := errors2.Wrap(err, "failed to parse GeoIPv6 MMDB database")
+		wrapped := fmt.Errorf("failed to parse GeoIPv6 MMDB database: %w", err)
 		_ = pipeWriter.CloseWithError(wrapped)
 		return wrapped
 	}
@@ -948,7 +961,7 @@ func (s *Ipdb) DownloadAndLoadGeoIpv6Mmdb() error {
 	_ = pipeWriter.Close()
 
 	if err := <-writeErrChan; err != nil {
-		return errors2.Wrap(err, "failed to write GeoIPv6 MMDB database")
+		return fmt.Errorf("failed to write GeoIPv6 MMDB database: %w", err)
 	}
 
 	return nil
@@ -961,66 +974,52 @@ func (s *Ipdb) Close() error {
 
 	if s.geoIpv4Mmdb != nil {
 		if err := s.geoIpv4Mmdb.Close(); err != nil {
-			return errors2.Wrap(err, "failed to close GeoIPv4 MMDB database")
+			return fmt.Errorf("failed to close GeoIPv4 MMDB database: %w", err)
 		}
 	}
 	if s.geoIpv6Mmdb != nil {
 		if err := s.geoIpv6Mmdb.Close(); err != nil {
-			return errors2.Wrap(err, "failed to close GeoIPv6 MMDB database")
+			return fmt.Errorf("failed to close GeoIPv6 MMDB database: %w", err)
 		}
 	}
 
-	// Dereference databases to allow them to be garbage collected.
-	s.torExitRanger = nil
-	s.datacenterRanger = nil
+	// Assign nil to all databases to allow the original ones to be freed by the GC.
+	for _, data := range s.rangeDbs {
+		data.Mu.Lock()
+		data.Ranger = nil
+		data.Mu.Unlock()
+	}
 	s.geoIpv4Mmdb = nil
 	s.geoIpv6Mmdb = nil
-
-	// Force garbage collection.
 	runtime.GC()
 
 	return nil
 }
 
-// IsIpTorExitNode returns whether the specified IP address is a Tor exit node.
-// If the required database is not initialized, returns NotInitializedError.
-func (s *Ipdb) IsIpTorExitNode(ip netip.Addr) (bool, error) {
+// IsIpInRangeDb returns whether an IP was found in the specified IP range database.
+// If the database does not exist, returns a NoSuchDatabaseError.
+// If the database has not been initialized, returns a NotInitializedError.
+// If the Ipdb instance has been closed, returns ErrIpdbClosed.
+func (s *Ipdb) IsIpInRangeDb(dbName string, ip netip.Addr) (bool, error) {
 	if !s.isRunning {
 		return false, ErrIpdbClosed
 	}
 
-	lock := s.torExitRangerMutex.RLock()
-	defer s.torExitRangerMutex.RUnlock(lock)
-
-	if !s.hasTorExit {
-		return false, NewNotInitializedError(DbTypeTorExit, fmt.Sprintf("cannot check if IP \"%s\" is a Tor exit node", ip.String()))
+	data, has := s.rangeDbs[dbName]
+	if !has {
+		return false, NewNoSuchDatabaseError(dbName)
 	}
 
-	has, err := s.torExitRanger.Contains(ip.AsSlice())
+	tok := data.Mu.RLock()
+	defer data.Mu.RUnlock(tok)
+
+	if !data.Has || data.Ranger == nil {
+		return false, NewNotInitializedError(dbName, fmt.Sprintf(`cannot check if IP "%s" is in range database "%s"`, ip.String(), dbName))
+	}
+
+	has, err := data.Ranger.Contains(ip.AsSlice())
 	if err != nil {
-		return false, errors2.Wrapf(err, "failed to check if IP \"%s\" is a Tor exit node", ip.String())
-	}
-
-	return has, nil
-}
-
-// IsIpDatacenter returns whether the specified IP address is a datacenter IP.
-// If the required database is not initialized, returns NotInitializedError.
-func (s *Ipdb) IsIpDatacenter(ip netip.Addr) (bool, error) {
-	if !s.isRunning {
-		return false, ErrIpdbClosed
-	}
-
-	lock := s.datacenterRangerMutex.RLock()
-	defer s.datacenterRangerMutex.RUnlock(lock)
-
-	if !s.hasDatacenter {
-		return false, NewNotInitializedError(DbTypeDatacenter, fmt.Sprintf("cannot check if IP \"%s\" is a datacenter IP", ip.String()))
-	}
-
-	has, err := s.datacenterRanger.Contains(ip.AsSlice())
-	if err != nil {
-		return false, errors2.Wrapf(err, "failed to check if IP \"%s\" is a datacenter IP", ip.String())
+		return false, fmt.Errorf(`failed to check if IP "%s" is in range database "%s": %w`, ip.String(), dbName, err)
 	}
 
 	return has, nil
@@ -1029,7 +1028,7 @@ func (s *Ipdb) IsIpDatacenter(ip netip.Addr) (bool, error) {
 // ResolveIpIsoCountry resolves the ISO 3166 country code for the specified IP address.
 // The country code is uppercase.
 // If no country can be found, defaults to defaultCc.
-// If the required database is not initialized, returns NotInitializedError.
+// If the required database is not initialized, returns a NotInitializedError.
 //
 // To avoid returning an invalid ISO 3166 country code, the defaultCc parameter should ideally be a valid ISO 3166 country code.
 // A good placeholder value is "AQ", which is the ISO 3166 country code for Antarctica.
@@ -1044,7 +1043,7 @@ func (s *Ipdb) ResolveIpIsoCountry(ip netip.Addr, defaultCc string) (string, err
 		defer s.geoIpv6MmdbMutex.RUnlock(lock)
 
 		if !s.hasGeoIpv4 {
-			return "", NewNotInitializedError(DbTypeGeoIpv6, fmt.Sprintf("cannot get country code for IP \"%s\"", ip.String()))
+			return "", NewNotInitializedError(DbNameGeoIpv6, fmt.Sprintf(`cannot get country code for IPv6 "%s"`, ip.String()))
 		}
 
 		db = s.geoIpv6Mmdb
@@ -1053,7 +1052,7 @@ func (s *Ipdb) ResolveIpIsoCountry(ip netip.Addr, defaultCc string) (string, err
 		defer s.geoIpv4MmdbMutex.RUnlock(lock)
 
 		if !s.hasGeoIpv4 {
-			return "", NewNotInitializedError(DbTypeGeoIpv4, fmt.Sprintf("cannot get country code for IP \"%s\"", ip.String()))
+			return "", NewNotInitializedError(DbNameGeoIpv4, fmt.Sprintf(`cannot get country code for IPv4 "%s"`, ip.String()))
 		}
 
 		db = s.geoIpv4Mmdb
@@ -1065,7 +1064,7 @@ func (s *Ipdb) ResolveIpIsoCountry(ip netip.Addr, defaultCc string) (string, err
 
 	err := db.Lookup(ip).Decode(&record)
 	if err != nil {
-		return "", errors2.Wrapf(err, "failed to lookup IP %s in geoIP database", ip.String())
+		return "", fmt.Errorf(`failed to lookup IP "%s" in geoIP database: %w`, ip.String(), err)
 	}
 
 	cc := record.CountryCode
