@@ -375,7 +375,7 @@ func NewIpdb(options Options) (*Ipdb, error) {
 
 			checkpoints.Checkpoints[name] = chkPnt
 		}
-		{
+		if s.geoIpv4Src != nil {
 			var chkPnt Checkpoint
 			var has bool
 			chkPnt, has = checkpoints.Checkpoints[DbNameGeoIpv4]
@@ -391,7 +391,7 @@ func NewIpdb(options Options) (*Ipdb, error) {
 
 			checkpoints.Checkpoints[DbNameGeoIpv4] = chkPnt
 		}
-		{
+		if s.geoIpv6Src != nil {
 			var chkPnt Checkpoint
 			var has bool
 			chkPnt, has = checkpoints.Checkpoints[DbNameGeoIpv6]
@@ -455,7 +455,7 @@ func NewIpdb(options Options) (*Ipdb, error) {
 					data.Src.RefreshInterval,
 				)
 			}
-			{
+			if s.geoIpv4Src != nil {
 				chkPnt := checkpoints.Checkpoints[DbNameGeoIpv4]
 				go s.runUpdater(
 					DbNameGeoIpv4,
@@ -463,7 +463,7 @@ func NewIpdb(options Options) (*Ipdb, error) {
 					s.geoIpv4Src.RefreshInterval,
 				)
 			}
-			{
+			if s.geoIpv6Src != nil {
 				chkPnt := checkpoints.Checkpoints[DbNameGeoIpv6]
 				go s.runUpdater(
 					DbNameGeoIpv6,
