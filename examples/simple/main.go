@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/termermc/go-ipdb/v2"
+	"github.com/termermc/go-ipdb"
 )
 
 // DbTorExit is the name of the IP range database that stores Tor exit nodes.

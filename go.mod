@@ -1,4 +1,4 @@
-module github.com/termermc/go-ipdb/v2
+module github.com/termermc/go-ipdb
 
 go 1.24.5
 

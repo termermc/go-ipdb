@@ -30,7 +30,7 @@ This library is useful if:
 Add to your project by running:
 
 ```bash
-go get github.com/termermc/go-ipdb/v2
+go get github.com/termermc/go-ipdb
 ```
 
 ## Examples
