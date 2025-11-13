@@ -89,40 +89,25 @@ func (s *FsStorageDriver) WriteDatabase(name string, input io.ReadCloser) error 
 		return err
 	}
 
-	filePath := filepath.Join(s.dataDir, filename)
-	bakFilePath := filepath.Join(s.dataDir, filename+".bak")
+	destFilePath := filepath.Join(s.dataDir, filename)
+	tmpFilePath := filepath.Join(s.dataDir, filename+".tmp")
 
-	backedUp := false
-
-	// Move existing file to backup if it exists.
-	if _, err = os.Stat(filePath); err == nil {
-		err = os.Rename(filePath, bakFilePath)
-		if err != nil {
-			return fmt.Errorf(`failed to move existing file "%s" to backup path "%s": %w`, filePath, bakFilePath, err)
-		}
-
-		backedUp = true
-	}
-
-	err = nil
-
-	if backedUp {
-		// If the function returns with an error, try to restore the backup.
-		defer func() {
-			if err != nil {
-				_ = os.Rename(bakFilePath, filePath)
-			}
-		}()
-	}
-
-	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, fsPermBits)
+	file, err := os.OpenFile(tmpFilePath, os.O_CREATE|os.O_WRONLY, fsPermBits)
 	if err != nil {
-		return fmt.Errorf(`failed to open file "%s" for writing database "%s": %w`, filePath, name, err)
+		return fmt.Errorf(`failed to open file "%s" for writing database "%s": %w`, destFilePath, name, err)
 	}
 
 	_, err = io.Copy(file, input)
 	if err != nil {
-		return fmt.Errorf(`failed to copy input to file "%s" for writing database "%s": %w`, filePath, name, err)
+		_ = file.Close()
+		return fmt.Errorf(`failed to copy input to file "%s" for writing database "%s": %w`, destFilePath, name, err)
+	}
+	_ = file.Close()
+
+	// Move temp file to destination path.
+	err = os.Rename(tmpFilePath, destFilePath)
+	if err != nil {
+		return fmt.Errorf(`failed to move temp file "%s" to destination path "%s": %w`, tmpFilePath, destFilePath, err)
 	}
 
 	return nil
@@ -145,20 +130,26 @@ func (s *FsStorageDriver) ReadDatabase(name string) (io.ReadCloser, error) {
 }
 
 func (s *FsStorageDriver) WriteCheckpoints(checkpoints *AllCheckpoints) error {
-	filePath := filepath.Join(s.dataDir, checkpointsFilename)
-	file, err := os.OpenFile(filePath, syscall.O_CREAT|syscall.O_WRONLY, fsPermBits)
-	if err != nil {
-		return fmt.Errorf(`failed to open file "%s" for writing checkpoints: %w`, filePath, err)
-	}
+	destFilePath := filepath.Join(s.dataDir, checkpointsFilename)
+	tmpFilePath := filepath.Join(s.dataDir, checkpointsFilename+".tmp")
 
-	defer func() {
-		_ = file.Close()
-	}()
+	file, err := os.OpenFile(tmpFilePath, syscall.O_CREAT|syscall.O_WRONLY, fsPermBits)
+	if err != nil {
+		return fmt.Errorf(`failed to open file "%s" for writing checkpoints: %w`, destFilePath, err)
+	}
 
 	enc := json.NewEncoder(file)
 	err = enc.Encode(checkpoints)
 	if err != nil {
-		return fmt.Errorf(`failed to encode checkpoints to JSON file at "%s": %w`, filePath, err)
+		_ = file.Close()
+		return fmt.Errorf(`failed to encode checkpoints to JSON file at "%s": %w`, destFilePath, err)
+	}
+	_ = file.Close()
+
+	// Move temp file to destination path.
+	err = os.Rename(tmpFilePath, destFilePath)
+	if err != nil {
+		return fmt.Errorf(`failed to move temp file "%s" to destination path "%s": %w`, tmpFilePath, destFilePath, err)
 	}
 
 	return nil
