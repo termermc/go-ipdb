@@ -92,7 +92,7 @@ func (s *FsStorageDriver) WriteDatabase(name string, input io.ReadCloser) error 
 	destFilePath := filepath.Join(s.dataDir, filename)
 	tmpFilePath := filepath.Join(s.dataDir, filename+".tmp")
 
-	file, err := os.OpenFile(tmpFilePath, os.O_CREATE|os.O_WRONLY, fsPermBits)
+	file, err := os.OpenFile(tmpFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fsPermBits)
 	if err != nil {
 		return fmt.Errorf(`failed to open file "%s" for writing database "%s": %w`, destFilePath, name, err)
 	}
@@ -161,6 +161,9 @@ func (s *FsStorageDriver) ReadCheckpoints() (*AllCheckpoints, error) {
 	if err != nil {
 		return nil, fmt.Errorf(`failed to open file "%s" for reading checkpoints: %w`, filePath, err)
 	}
+	defer func() {
+		_ = file.Close()
+	}()
 
 	var res AllCheckpoints
 	dec := json.NewDecoder(file)
