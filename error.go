@@ -33,6 +33,7 @@ func (err *NotInitializedError) Error() string {
 func NewNotInitializedError(name string, msg string) *NotInitializedError {
 	return &NotInitializedError{
 		Name: name,
+		Msg:  msg,
 	}
 }
 
