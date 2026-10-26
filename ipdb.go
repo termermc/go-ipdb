@@ -702,6 +702,10 @@ func (s *Ipdb) loadRangesFromReader(reader io.Reader, name string) error {
 
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() && len(failures) < maxFailures {
+		if err = scanner.Err(); err != nil {
+			return fmt.Errorf(`range reader returned error: %w`, err)
+		}
+
 		line := scanner.Text()
 
 		// Skip empty lines and comments.
@@ -1042,7 +1046,7 @@ func (s *Ipdb) ResolveIpIsoCountry(ip netip.Addr, defaultCc string) (string, err
 		lock := s.geoIpv6MmdbMutex.RLock()
 		defer s.geoIpv6MmdbMutex.RUnlock(lock)
 
-		if !s.hasGeoIpv4 {
+		if !s.hasGeoIpv6 {
 			return "", NewNotInitializedError(DbNameGeoIpv6, fmt.Sprintf(`cannot get country code for IPv6 "%s"`, ip.String()))
 		}
 
