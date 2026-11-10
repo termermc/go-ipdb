@@ -8,7 +8,7 @@ Automatically downloads and caches various types of IP databases for local in-pr
 
 Supports the following operations:
  - Get ISO 3166 country code for IP address (geoIP)
- - Check if IP address is a range database (such as Tor exit nodes or known VPNs)
+ - Check if IP address is in a range database (such as Tor exit nodes or known VPNs)
  - Optional bring-your-own download logic
  - Optional bring-your-own caching logic
 
@@ -41,13 +41,18 @@ Below are some simpler examples demonstrating the basic usage of the library.
 
 ## IP to Country
 
-The IP to country system uses the MaxMindDB (`.mmdb`) format. By specifying a URL to a mirror of the MaxMind GeoLite2 database,
-your application can resolve the ISO 3166 country code of visitor IP addresses. A default can be provided if the IP address's country is not known.
+The IP to country system uses the MaxMindDB (`.mmdb`) format. By specifying a URL to a mirror of the MaxMind GeoLite2
+database, your application can resolve the ISO 3166 country code of visitor IP addresses. A default must be provided for
+when the IP address's country is not known.
+
+Both MaxMind's own schema (`country.iso_code`) and the flat schema used by many mirrors (`country_code`) are supported.
+If a source has multiple URLs, they are treated as mirrors and the first one that yields a valid database is used.
 
 ```go
 ip := netip.MustParseAddr("13.107.246.40")
 
-cc, err := ipdb.ResolveIpIsoCountry(ip)
+// "AQ" (Antarctica) is returned if the country is not known.
+cc, err := ipdb.ResolveIpIsoCountry(ip, "AQ")
 if err != nil {
 	panic(err)
 }
@@ -60,6 +65,7 @@ println(cc) // US
 The IP range database check system uses newline-separated list(s) of IP ranges in CIDR notation or bare IP addresses.
 Any bare IP addresses will be assumed to be `/32` for IPv4 and `/128` for IPv6.
 Bare IPs and CIDR ranges can be mixed in the same list.
+Empty lines and lines prefixed with `#` are ignored.
 
 All lists will be loaded into the in-memory database and IPs can be checked against them.
 Multiple lists can be combined for better detection.
