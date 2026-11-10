@@ -1,11 +1,14 @@
 package ipdb
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -34,8 +37,12 @@ func TestNewFsStorageDriver_PathIsNotDirectory(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error for non-directory path, got driver: %+v", drv)
 	}
-	// Implementation currently returns a generic wrapped error; just assert it's an error
-	_ = drv
+	if !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("expected ENOTDIR, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "%!") {
+		t.Fatalf("malformed error message: %q", err.Error())
+	}
 }
 
 func TestFsStorageDriver_WriteAndReadDatabase(t *testing.T) {
@@ -57,7 +64,9 @@ func TestFsStorageDriver_WriteAndReadDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDatabase failed: %v", err)
 	}
-	defer r.Close()
+	defer func() {
+		_ = r.Close()
+	}()
 
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -72,7 +81,7 @@ func TestFsStorageDriver_WriteAndReadDatabase(t *testing.T) {
 // faultyReader simulates a reader that fails after some bytes
 type faultyReader struct{}
 
-func (f *faultyReader) Read(p []byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (f *faultyReader) Read(_ []byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 func (f *faultyReader) Close() error               { return nil }
 
 func TestFsStorageDriver_BackupAndRestoreOnWriteFailure(t *testing.T) {
@@ -100,7 +109,9 @@ func TestFsStorageDriver_BackupAndRestoreOnWriteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDatabase failed: %v", err)
 	}
-	defer r.Close()
+	defer func() {
+		_ = r.Close()
+	}()
 	data, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatalf("ReadAll failed: %v", err)
@@ -204,5 +215,138 @@ func TestDbNameTooLong_Error(t *testing.T) {
 	}
 	if !errors.Is(err, ErrDbNameTooLong) {
 		t.Fatalf("expected ErrDbNameTooLong, got: %v", err)
+	}
+}
+
+// A temp file left behind by an interrupted write does not corrupt the next
+// checkpoints file.
+func TestFsStorageDriver_WriteCheckpoints_IgnoresStaleTempFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	drv, err := NewFsStorageDriver(tmpDir)
+	if err != nil {
+		t.Fatalf("NewFsStorageDriver failed: %v", err)
+	}
+
+	// Simulate a longer temp file left behind by an interrupted write.
+	stale := []byte(`{"checkpoints":{"some_very_long_database_name_here":{"last_updated_unix":1234567890}}}`)
+	if err := os.WriteFile(filepath.Join(tmpDir, checkpointsFilename+".tmp"), stale, 0644); err != nil {
+		t.Fatalf("failed to create stale temp file: %v", err)
+	}
+
+	cps := &AllCheckpoints{Checkpoints: map[string]Checkpoint{
+		"a": {LastUpdatedUnix: 1},
+	}}
+	if err := drv.WriteCheckpoints(cps); err != nil {
+		t.Fatalf("WriteCheckpoints failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(tmpDir, checkpointsFilename))
+	if err != nil {
+		t.Fatalf("failed to read checkpoints file: %v", err)
+	}
+	if !json.Valid(raw) {
+		t.Errorf("checkpoints file is not valid JSON after WriteCheckpoints: %q", string(raw))
+	}
+}
+
+// Writing a database does not affect another database whose name looks like a
+// temp file name.
+func TestFsStorageDriver_WriteDatabase_DoesNotClobberTempLikeNames(t *testing.T) {
+	drv, err := NewFsStorageDriver(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFsStorageDriver failed: %v", err)
+	}
+
+	if err := drv.WriteDatabase("a.tmp", io.NopCloser(strings.NewReader("database a.tmp contents"))); err != nil {
+		t.Fatalf("initial WriteDatabase failed: %v", err)
+	}
+	if err := drv.WriteDatabase("a", io.NopCloser(strings.NewReader("database a contents"))); err != nil {
+		t.Fatalf("WriteDatabase failed: %v", err)
+	}
+
+	r, err := drv.ReadDatabase("a.tmp")
+	if err != nil {
+		t.Fatalf("writing database \"a\" destroyed database \"a.tmp\": %v", err)
+	}
+	defer func() {
+		_ = r.Close()
+	}()
+
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if string(got) != "database a.tmp contents" {
+		t.Errorf("database \"a.tmp\" was corrupted by writing database \"a\": got %q", string(got))
+	}
+}
+
+// Concurrent writes of the same database each use their own temp file, so the
+// result is one complete write and no temp files are left behind.
+func TestFsStorageDriver_WriteDatabase_ConcurrentWritesDoNotInterleave(t *testing.T) {
+	dir := t.TempDir()
+	drv, err := NewFsStorageDriver(dir)
+	if err != nil {
+		t.Fatalf("NewFsStorageDriver failed: %v", err)
+	}
+
+	const writers = 8
+	const size = 1 << 20
+
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			content := bytes.Repeat([]byte{byte('a' + i)}, size)
+			if err := drv.WriteDatabase("db", io.NopCloser(bytes.NewReader(content))); err != nil {
+				t.Errorf("WriteDatabase failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := os.ReadFile(filepath.Join(dir, "db"))
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if len(got) != size || !bytes.Equal(got, bytes.Repeat(got[:1], size)) {
+		t.Errorf("database file is a mix of multiple writes (length %d)", len(got))
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("expected only the database file in the data directory, found %d entries", len(entries))
+	}
+}
+
+// Names that would collide with the checkpoints file or temp files, or are not
+// valid filenames, are rejected without touching existing data.
+func TestFsStorageDriver_RejectsReservedDatabaseNames(t *testing.T) {
+	drv, err := NewFsStorageDriver(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFsStorageDriver failed: %v", err)
+	}
+
+	cps := &AllCheckpoints{Checkpoints: map[string]Checkpoint{"a": {LastUpdatedUnix: 1}}}
+	if err := drv.WriteCheckpoints(cps); err != nil {
+		t.Fatalf("WriteCheckpoints failed: %v", err)
+	}
+
+	for _, name := range []string{checkpointsFilename, "", ".", "..", tmpFilePrefix + "123"} {
+		err := drv.WriteDatabase(name, io.NopCloser(strings.NewReader("db contents")))
+		if !errors.Is(err, ErrInvalidDbName) {
+			t.Errorf("WriteDatabase(%q) returned %v, want ErrInvalidDbName", name, err)
+		}
+		if _, err := drv.ReadDatabase(name); !errors.Is(err, ErrInvalidDbName) {
+			t.Errorf("ReadDatabase(%q) returned %v, want ErrInvalidDbName", name, err)
+		}
+	}
+
+	if _, err := drv.ReadCheckpoints(); err != nil {
+		t.Errorf("checkpoints are unreadable after rejected writes: %v", err)
 	}
 }

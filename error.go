@@ -15,6 +15,23 @@ var ErrDataSourceNoSource = errors.New("data source has no sources: len(Urls) ==
 // ErrAllUrlsFailed is returned when all URLs in a data source failed.
 var ErrAllUrlsFailed = errors.New("all URLs in data source failed")
 
+// ErrFailedByRetryPolicy is returned when a database update was failed by the RetryPolicy returning RetryActionFail.
+// The error also wraps the error of the source that failed.
+var ErrFailedByRetryPolicy = errors.New("database update was failed by the retry policy")
+
+// HttpStatusError is returned when downloading a source yields a response with a status code other than 200.
+type HttpStatusError struct {
+	// The response status code.
+	StatusCode int
+
+	// The start of the response body, which may help explain the error.
+	BodyPreview string
+}
+
+func (err *HttpStatusError) Error() string {
+	return fmt.Sprintf("status code was %d (expected %d): %q", err.StatusCode, 200, err.BodyPreview)
+}
+
 // NotInitializedError is returned when a function is run that required an IP database to be initialized, but it was not initialized.
 // Includes the IP database type that was required but not initialized.
 type NotInitializedError struct {
@@ -29,13 +46,27 @@ func (err *NotInitializedError) Error() string {
 	return fmt.Sprintf("ipdb %s not initialized: %s", err.Name, err.Msg)
 }
 
-// NewNotInitializedError creates a new NewNotInitializedError instance with the specified database name and message.
+// NewNotInitializedError creates a new NotInitializedError instance with the specified database name and message.
 func NewNotInitializedError(name string, msg string) *NotInitializedError {
 	return &NotInitializedError{
 		Name: name,
 		Msg:  msg,
 	}
 }
+
+// ErrDatabaseTooLarge is returned when a database is larger than the maximum database size.
+// See Options.MaxDatabaseSize.
+var ErrDatabaseTooLarge = errors.New("database is too large")
+
+// ErrNoRanges is returned when a range database contains no IP addresses or CIDR ranges.
+// A source that yields an empty list is treated as broken, rather than replacing existing data with nothing.
+var ErrNoRanges = errors.New("range database contains no IP addresses or CIDR ranges")
+
+// ErrInvalidRefreshInterval is returned when a data source's RefreshInterval is not positive while downloading is enabled.
+var ErrInvalidRefreshInterval = errors.New("data source RefreshInterval must be positive")
+
+// ErrInvalidDbName is returned when a database name is empty, reserved or otherwise unusable.
+var ErrInvalidDbName = errors.New("invalid database name")
 
 // ErrIpdbClosed is returned when an operation is attempted on a closed IP database.
 var ErrIpdbClosed = errors.New("ipdb closed")
@@ -51,7 +82,7 @@ type NoSuchDatabaseError struct {
 }
 
 func (err *NoSuchDatabaseError) Error() string {
-	return fmt.Sprintf(`IP range database "%s" does not exist`, err.Name)
+	return fmt.Sprintf(`IP range database %q does not exist`, err.Name)
 }
 
 // NewNoSuchDatabaseError creates a new NoSuchDatabaseError instance with the specified database name.

@@ -52,7 +52,8 @@ func main() {
 		Logger:        logger,
 
 		// You can optionally provide your own HTTP client to use for downloading databases.
-		// By default, it uses a client with a 10-second timeout.
+		// By default, it uses a client with a timeout of ipdb.DefaultHttpTimeout per download
+		// and ipdb.DefaultHttpResponseHeaderTimeout for receiving response headers.
 		HttpClient: nil,
 
 		// You can set this to true to disable downloading databases.
