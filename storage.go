@@ -101,8 +101,6 @@ func (s *FsStorageDriver) ValidateDatabaseName(name string) error {
 		return fmt.Errorf(`%w: %q is reserved for the checkpoints file`, ErrInvalidDbName, name)
 	case strings.HasPrefix(name, tmpFilePrefix):
 		return fmt.Errorf(`%w: names starting with %q are reserved for temporary files`, ErrInvalidDbName, tmpFilePrefix)
-	case strings.ContainsAny(name, "/\\"):
-		return fmt.Errorf(`%w: name must not contain slashes`, ErrInvalidDbName)
 	}
 
 	return nil
